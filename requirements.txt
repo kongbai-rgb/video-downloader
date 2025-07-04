@@ -1,6 +1,2 @@
-yt-dlp>=2024.1.0
-PyQt5>=5.15.0
-requests>=2.25.0
-openpyxl>=3.0.0
-pyinstaller>=5.0
-pillow>=9.0.0
+flask
+yt-dlp 
