@@ -20,19 +20,26 @@ class DownloadThread(QThread):
         self.url = url
         self.folder = folder
         self.row = row
+        self.max_retries = 3
 
     def run(self):
         ydl_opts = {
             'outtmpl': os.path.join(self.folder, '%(title)s.%(ext)s'),
             'progress_hooks': [self.hook],
             'proxy': 'http://127.0.0.1:7890',
+            'format': 'bestvideo+bestaudio/best',
         }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([self.url])
-            self.finished.emit(self.row, '完成')
-        except Exception as e:
-            self.error.emit(self.row, str(e))
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([self.url])
+                self.finished.emit(self.row, '完成')
+                return
+            except Exception as e:
+                if attempt == self.max_retries:
+                    self.error.emit(self.row, f'失败({e})')
+                else:
+                    continue
 
     def hook(self, d):
         if d['status'] == 'downloading':
@@ -168,9 +175,10 @@ class VideoDownloader(QWidget):
                     self.list_table.item(i, col).setBackground(QColor('#e0e0e0'))
 
     def import_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, '选择包含视频链接的文件', self.last_import_dir, 'Text/Excel Files (*.txt *.xlsx);;All Files (*)')
+        import os
+        default_dir = self.last_import_dir if self.last_import_dir else os.path.join(os.path.expanduser('~'), 'Desktop')
+        file_path, _ = QFileDialog.getOpenFileName(self, '选择包含视频链接的文件', default_dir, 'Text/Excel Files (*.txt *.xlsx);;All Files (*)')
         if file_path:
-            import os
             self.last_import_dir = os.path.dirname(file_path)
             try:
                 links = []
