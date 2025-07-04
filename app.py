@@ -1,67 +1,199 @@
-from flask import Flask, request, jsonify, render_template, send_file
+import sys
 import os
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QFileDialog, QComboBox, QMessageBox, QProgressBar, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QColor
 import yt_dlp
-import tempfile
-import base64
+import openpyxl
+import re
 
-app = Flask(__name__)
-app.config['TEMPLATES_AUTO_RELOAD'] = True
+class DownloadThread(QThread):
+    progress = pyqtSignal(int, float)  # 行号, 进度百分比
+    finished = pyqtSignal(int, str)    # 行号, 完成/错误信息
+    error = pyqtSignal(int, str)       # 行号, 错误信息
 
-def download_video(url):
-    # 使用yt-dlp下载视频到临时文件夹，优先高清mp4，支持代理，自动降级格式
-    temp_dir = tempfile.mkdtemp()
-    ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'proxy': 'http://127.0.0.1:7890',
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        # 自动查找实际下载的文件（兼容不同格式）
-        if not os.path.exists(filename):
-            base = os.path.splitext(filename)[0]
-            for ext in ['.mp4', '.mkv', '.webm', '.flv', '.avi']:
-                alt = base + ext
-                if os.path.exists(alt):
-                    filename = alt
-                    break
-        print(f"[DEBUG] yt-dlp 下载文件路径: {filename}")
-        return filename
+    def __init__(self, url, folder, row):
+        super().__init__()
+        self.url = url
+        self.folder = folder
+        self.row = row
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+    def run(self):
+        ydl_opts = {
+            'outtmpl': os.path.join(self.folder, '%(title)s.%(ext)s'),
+            'progress_hooks': [self.hook],
+            'proxy': 'http://127.0.0.1:7890',
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([self.url])
+            self.finished.emit(self.row, '完成')
+        except Exception as e:
+            self.error.emit(self.row, str(e))
 
-@app.route('/download', methods=['POST'])
-def download():
-    data = request.get_json(force=True)
-    url = data.get('url')
-    try:
-        filepath = download_video(url)
-        if not os.path.exists(filepath) or os.path.getsize(filepath) < 1024 * 10:
-            # 文件不存在或过小，视为下载失败
-            return jsonify({'success': False, 'msg': '下载失败，可能是视频受限或格式不支持，请更换链接再试。'}), 400
-        filename = os.path.basename(filepath)
-        # 用base64编码完整路径
-        b64path = base64.urlsafe_b64encode(filepath.encode('utf-8')).decode('ascii')
-        return jsonify({'success': True, 'msg': f'下载已完成，请在浏览器下载栏或本地下载文件夹查找：{filename}', 'download_url': f'/file_by_path/{b64path}'})
-    except Exception as e:
-        return jsonify({'success': False, 'msg': f'下载失败：{str(e)}'}), 500
+    def hook(self, d):
+        if d['status'] == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            downloaded = d.get('downloaded_bytes', 0)
+            if total:
+                percent = downloaded / total * 100
+                self.progress.emit(self.row, percent)
+        elif d['status'] == 'finished':
+            self.progress.emit(self.row, 100)
 
-@app.route('/file_by_path/<b64path>')
-def file_by_path(b64path):
-    try:
-        filepath = base64.urlsafe_b64decode(b64path.encode('ascii')).decode('utf-8')
-        if os.path.exists(filepath):
-            filename = os.path.basename(filepath)
-            return send_file(filepath, as_attachment=True, download_name=filename)
-        else:
-            return '文件未找到', 404
-    except Exception as e:
-        return f'路径解析失败: {e}', 400
+class VideoDownloader(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('Ins & YouTube 视频下载器')
+        self.setGeometry(500, 300, 800, 600)
+        self.last_import_dir = ''  # 记录上次导入路径
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        # 链接输入
+        hlayout1 = QHBoxLayout()
+        hlayout1.addWidget(QLabel('视频链接:'))
+        self.url_input = QLineEdit()
+        hlayout1.addWidget(self.url_input)
+        self.download_btn = QPushButton('下载')
+        self.download_btn.clicked.connect(self.start_download)
+        hlayout1.addWidget(self.download_btn)
+        self.import_btn = QPushButton('导入文件')
+        self.import_btn.clicked.connect(self.import_file)
+        hlayout1.addWidget(self.import_btn)
+        layout.addLayout(hlayout1)
+
+        # 下载列表区域（表格）
+        self.list_table = QTableWidget()
+        self.list_table.setColumnCount(3)
+        self.list_table.setHorizontalHeaderLabels(['下载链接', '下载进度', '是否完成'])
+        self.list_table.verticalHeader().setVisible(False)
+        self.list_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.list_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.list_table.setShowGrid(True)
+        self.list_table.setFixedHeight(self.list_table.verticalHeader().defaultSectionSize() * 10 + 30)  # 10行高度
+        self.list_table.horizontalHeader().setStretchLastSection(False)
+        self.list_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.list_table.setColumnWidth(0, int(self.width() * 0.5))
+        self.list_table.setColumnWidth(1, int(self.width() * 0.25))
+        self.list_table.setColumnWidth(2, int(self.width() * 0.25))
+        def resizeEvent(event):
+            self.list_table.setColumnWidth(0, int(self.list_table.width() * 0.5))
+            self.list_table.setColumnWidth(1, int(self.list_table.width() * 0.25))
+            self.list_table.setColumnWidth(2, int(self.list_table.width() * 0.25))
+            QWidget.resizeEvent(self, event)
+        self.resizeEvent = resizeEvent
+        layout.addWidget(self.list_table)
+
+        # 文件夹选择
+        hlayout3 = QHBoxLayout()
+        hlayout3.addWidget(QLabel('保存到:'))
+        self.folder_input = QLineEdit()
+        self.folder_input.setReadOnly(True)
+        hlayout3.addWidget(self.folder_input)
+        self.folder_btn = QPushButton('选择文件夹')
+        self.folder_btn.clicked.connect(self.choose_folder)
+        hlayout3.addWidget(self.folder_btn)
+        layout.addLayout(hlayout3)
+
+        self.setLayout(layout)
+
+        self.url_input.textChanged.connect(self.sync_list_area)
+
+    def choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, '选择保存文件夹')
+        if folder:
+            self.folder_input.setText(folder)
+
+    def start_download(self):
+        folder = self.folder_input.text().strip()
+        if not folder:
+            QMessageBox.warning(self, '提示', '请选择保存文件夹！')
+            return
+        self.download_btn.setEnabled(False)
+        links = self.url_input.text().splitlines()
+        self.download_threads = []
+        for i, url in enumerate(links):
+            url = url.strip()
+            if not url:
+                continue
+            self.list_table.setItem(i, 1, QTableWidgetItem('0%'))
+            self.list_table.setItem(i, 2, QTableWidgetItem('下载中'))
+            thread = DownloadThread(url, folder, i)
+            thread.progress.connect(self.update_progress)
+            thread.finished.connect(self.update_finished)
+            thread.error.connect(self.update_error)
+            self.download_threads.append(thread)
+            thread.start()
+
+    def update_progress(self, row, percent):
+        self.list_table.setItem(row, 1, QTableWidgetItem(f'{percent:.0f}%'))
+
+    def update_finished(self, row, msg):
+        self.list_table.setItem(row, 2, QTableWidgetItem(msg))
+        self.list_table.setItem(row, 1, QTableWidgetItem('100%'))
+        # 检查是否全部完成
+        if all(self.list_table.item(i, 2) and self.list_table.item(i, 2).text() in ['完成', '失败'] for i in range(self.list_table.rowCount())):
+            self.download_btn.setEnabled(True)
+
+    def update_error(self, row, msg):
+        self.list_table.setItem(row, 2, QTableWidgetItem('失败'))
+        self.list_table.setItem(row, 1, QTableWidgetItem('0%'))
+        # 检查是否全部完成
+        if all(self.list_table.item(i, 2) and self.list_table.item(i, 2).text() in ['完成', '失败'] for i in range(self.list_table.rowCount())):
+            self.download_btn.setEnabled(True)
+
+    def sync_list_area(self):
+        links = self.url_input.text().splitlines()
+        self.list_table.setRowCount(len(links))
+        for i, link in enumerate(links):
+            item_link = QTableWidgetItem(link)
+            item_progress = QTableWidgetItem('')
+            item_status = QTableWidgetItem('')
+            self.list_table.setItem(i, 0, item_link)
+            self.list_table.setItem(i, 1, item_progress)
+            self.list_table.setItem(i, 2, item_status)
+            # 交替颜色
+            for col in range(3):
+                if i % 2 == 0:
+                    self.list_table.setRowHeight(i, 25)
+                    self.list_table.item(i, col).setBackground(QColor('#f5f5f5'))
+                else:
+                    self.list_table.setRowHeight(i, 25)
+                    self.list_table.item(i, col).setBackground(QColor('#e0e0e0'))
+
+    def import_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, '选择包含视频链接的文件', self.last_import_dir, 'Text/Excel Files (*.txt *.xlsx);;All Files (*)')
+        if file_path:
+            import os
+            self.last_import_dir = os.path.dirname(file_path)
+            try:
+                links = []
+                if file_path.lower().endswith('.txt'):
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        links = [line.strip() for line in f if line.strip()]
+                elif file_path.lower().endswith('.xlsx'):
+                    wb = openpyxl.load_workbook(file_path, read_only=True)
+                    for ws in wb.worksheets:
+                        for row in ws.iter_rows(values_only=True):
+                            for cell in row:
+                                if isinstance(cell, str):
+                                    found = re.findall(r'https?://\S+', cell)
+                                    links.extend(found)
+                if links:
+                    self.url_input.setText('\n'.join(links))
+                else:
+                    QMessageBox.warning(self, '提示', '未在文件中识别到有效链接。')
+            except Exception as e:
+                QMessageBox.critical(self, '错误', f'导入文件失败: {e}')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000) 
+    app = QApplication(sys.argv)
+    win = VideoDownloader()
+    win.show()
+    sys.exit(app.exec_()) 
